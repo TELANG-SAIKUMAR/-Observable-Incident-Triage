@@ -9,9 +9,9 @@ const CFG = {
   port: +process.env.PORT || 8080,
   dataDir: process.env.DATA_DIR || path.join(__dirname, 'data'),
   llmBase: (process.env.LLM_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta/openai').replace(/\/+$/, ''),
-  llmKey: process.env.LLM_API_KEY || '',
+  llmKey: (process.env.LLM_API_KEY || '').trim(),
   llmModel: process.env.LLM_MODEL || 'gemini-2.5-flash-lite',
-  llmTimeout: +process.env.LLM_TIMEOUT_MS || 12000,
+  llmTimeout: +process.env.LLM_TIMEOUT_MS || 14000,
 };
 const PROFILE = 'ga5-incident-agent/v2';
 const MAX_BODY = 8 * 1024 * 1024;
@@ -87,7 +87,7 @@ Rules:
 Return ONLY JSON:
 {"rootCause":"...","evidence":["ev_.."],"diagnostics":[{"toolName":"...","arguments":{},"evidence":["ev_.."]}],"effect":{"toolName":"...","arguments":{},"evidence":["ev_.."]}}`;
 
-async function callModel(input) {
+async function callModel(input, timeoutMs) {
   const user = JSON.stringify({
     incident: input.incident,
     toolCatalog: input.toolCatalog,
@@ -100,9 +100,15 @@ async function callModel(input) {
       model: CFG.llmModel, temperature: 0, response_format: { type: 'json_object' },
       messages: [{ role: 'system', content: SYSTEM_PROMPT }, { role: 'user', content: user }],
     }),
-    signal: AbortSignal.timeout(CFG.llmTimeout),
+    signal: AbortSignal.timeout(timeoutMs),
   });
-  if (!res.ok) throw new Error('llm http ' + res.status);
+  if (!res.ok) {
+    let detail = '';
+    try { detail = (await res.text()).slice(0, 300); } catch {}
+    const err = new Error('llm http ' + res.status + ' ' + detail);
+    err.status = res.status;
+    throw err;
+  }
   const j = await res.json();
   let txt = j.choices[0].message.content.trim().replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
   return { raw: JSON.parse(txt), usage: j.usage || null };
@@ -173,12 +179,23 @@ function fallbackPlan(input) {
 
 async function planIncident(input) {
   const out = { startNs: nowNs(), error: null, usage: null };
-  let plan;
-  try {
-    const r = await callModel(input);
-    plan = sanitizePlan(r.raw, input);
-    out.usage = r.usage;
-  } catch (e) {
+  const began = Date.now();
+  const BUDGET = 16000; // stay under the grader's 18 s per-request limit
+  let plan = null;
+  for (let attempt = 1; attempt <= 2 && !plan; attempt++) {
+    const left = BUDGET - (Date.now() - began);
+    if (left < 3000) break;
+    try {
+      const r = await callModel(input, Math.min(CFG.llmTimeout, left));
+      plan = sanitizePlan(r.raw, input);
+      out.usage = r.usage;
+    } catch (e) {
+      console.error('PLANNER FAILED (attempt ' + attempt + '):', e && e.message);
+      // wait briefly before the one retry
+      if (attempt === 1 && Date.now() - began < 8000) await new Promise(r => setTimeout(r, 1500));
+    }
+  }
+  if (!plan) {
     out.error = 'planner_error';
     plan = fallbackPlan(input);
   }
@@ -356,9 +373,7 @@ function buildOtlp(st) {
     }
   }
   if (diagSpans.length >= 2) {
-    const s = Math.min(...diagSpans.map(x => +x.endTimeUnixNano)), e = Math.max(...diagSpans.map(x => +x.endTimeUnixNano));
-    const jStart = String(BigInt(diagSpans.reduce((m, x) => (BigInt(x.endTimeUnixNano) > m ? BigInt(x.endTimeUnixNano) : m), 0n)));
-    void s; void e;
+    const jStart = String(diagSpans.reduce((m, x) => (BigInt(x.endTimeUnixNano) > m ? BigInt(x.endTimeUnixNano) : m), 0n));
     const j = mk('incident.join', 1, st.joinSpanId, st.agentSpanId, jStart, jStart, [N('ga5.join.count', diagSpans.length)]);
     j.links = diagSpans.map(x => ({ traceId: T, spanId: x.spanId }));
     spans.push(j);
@@ -474,6 +489,7 @@ function makeServer() {
 
 if (require.main === module) {
   fs.mkdirSync(CFG.dataDir, { recursive: true });
+  if (!CFG.llmKey) console.error('WARNING: LLM_API_KEY is not set. Every run will use the weak fallback.');
   makeServer().listen(CFG.port, () => console.log('incident agent on :' + CFG.port));
 }
 module.exports = { makeServer, CFG };
